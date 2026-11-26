@@ -2,51 +2,26 @@
 //  kern_igfx_hdmib.hpp
 //  HDMI on DDI B for AppleIntelICLLPGraphicsFramebuffer (Intel Ice Lake, macOS 15 / 26)
 //
-//  Baked-in build. This file is part of the WhateverGreen source tree and is included by kern_igfx.cpp; there is no
-//  install script, no boot argument to remember and no DeviceProperties entry to write:
-//
-//    * the module is active on the Ice Lake LP framebuffer as soon as the kext loads (`igfxhdmib-off=1` disables it);
-//    * the HDMI connector it needs is written into the platform table of the framebuffer kext at load time
-//      (patchConnectorEntry below), which replaces the `framebuffer-patch0-find/-replace` pair the release builds
-//      asked the user to paste into config.plist.
+//  Baked-in build: part of the WhateverGreen tree, included by kern_igfx.cpp. No install script, no boot argument and no
+//  DeviceProperties entry -- the module is active on the Ice Lake LP framebuffer as soon as the kext loads, and the HDMI
+//  connector it needs is written into the platform table at load time (patchConnectorEntry), which replaces the
+//  framebuffer-patch0-find/-replace pair the release builds asked the user to paste into config.plist.
+//  `igfxhdmib-off=1` is the only one worth remembering: it disables the module.
 //
 //  Why it exists
 //  -------------
-//  Apple's Ice Lake framebuffer driver only knows DisplayPort sinks on DDI B: it detects a monitor with DPCD reads over the
-//  AUX channel, which an HDMI sink does not have. Plugging an HDMI cable therefore logs "Hotplug detected on unsupported ddi 1"
-//  and nothing lights up. This module teaches the driver to treat that port as an HDMI/TMDS sink:
-//    * HPD-only sink detection (no AUX / DPCD) for the HDMI port;
-//    * its own EDID reader (GMBUS, GPIO bit-bang as a fallback), because Apple's DDC path is DisplayPort-oriented;
-//    * the plumbing Apple's AGDC client never does for an injected framebuffer (display path, resource configuration,
-//      connect event, hardware cursor memory), and the display-buffer (DBUF) slice 2 power-up that pipe B needs;
-//    * work-arounds for panics and stalls that appear with HDMI hot-plugging (DC6 double-enable, AUX timeouts, VRR errors).
-//
-//  Boot-args (all optional, all with baked defaults; none of them is required)
-//    igfxhdmib-off=1          disable the module (escape hatch, e.g. to boot a machine where it misbehaves)
-//    igfxhdmib-ddi=N          DDI that carries the HDMI port (default 1 = DDI B). Also used for the baked connector entry
-//    igfxhdmib-fb=N           framebuffer index of that port (default: 2, then taken from the driver at the first hotplug)
-//    igfxhdmib-bootdetect=S   if the cable is already plugged at boot, run the hotplug S seconds after the first mode set
-//                             (default 3, 0 = off). Apple never raises a hotplug for a cable that was plugged before boot.
-//    igfxhdmib-wake=1         opt-in fallback for "online after wake but dark": re-fire the hotplug once after a
-//                             power-state change (default 0 = off; the rc6+hj38 logic needs no help on most machines).
-//    igfxhdmib-wake-delay=M   delay in ms before the wake fallback fires (default 1500, range 100..10000).
-//    igfxhdmib-hwcursor=0|1   1 (default) = real hardware cursor on the HDMI framebuffer, 0 = software cursor there
-//    igfxhdmib-swcursor=1     software cursor on every framebuffer
-//    igfxhdmib-aux=0          do not short-circuit the AUX reads the accelerator keeps issuing for the HDMI stream
-//    igfxhdmib-dc6fix=0       do not skip the second enableHWDC6() (panic "DC6 is already enabled")
-//    igfxhdmib-edid-fallback=1  if the monitor's EDID cannot be read, present a generic 1024x768@60 EDID instead of nothing
-//    igfxhdmib-rgb=-1|0|1|2   colour-format control. A sink that advertises YCbCr makes the driver send YCbCr 4:4:4 in the HDMI AVI
-//                             infoframe, which this path cannot handle (purple/magenta picture).
-//                               -1 (default) = automatic: if the EDID advertises YCbCr, behave as 2; otherwise leave the EDID untouched
-//                                2 = hide YCbCr support AND the CEA extension block, the sink is treated as plain DVI/RGB (no infoframes)
-//                                1 = only hide the YCbCr bits   0 = never touch the EDID
-//    igfxhdmib-force=1        run on a macOS version whose private structure layout has not been verified (see Layout)
-//
-//  Diagnostics:  ioreg -l | grep HDMIB      (HDMIB-status, HDMIB-layout, HDMIB-hooks, HDMIB-port, HDMIB-edid)
-//                dmesg | grep HDMIB
+//  Apple's Ice Lake driver only knows DisplayPort sinks on DDI B: it probes with DPCD reads over AUX, which an HDMI sink
+//  does not have, so an HDMI cable logs "Hotplug detected on unsupported ddi 1" and nothing lights up. The module teaches
+//  the driver to treat that port as an HDMI/TMDS sink: HPD-only detection, its own EDID reader (GMBUS, GPIO as fallback),
+//  the display-path / resource / cursor plumbing Apple's AGDC client never does for an injected framebuffer, the DBUF
+//  slice 2 power-up pipe B needs, and work-arounds for the DC6 / AUX / VRR stalls HDMI hot-plugging triggers.
 //
 //  The module touches private, undocumented structures of Apple's kext. The offsets live in ONE table (Layout) keyed by the
 //  Darwin major version; on a version that is not in the table the module stays idle instead of risking a kernel panic.
+//
+//  Every igfxhdmib-* boot argument and diagnostic value is documented in HDMIB-BAKED.md next to this tree.
+//    ioreg -l | grep HDMIB      HDMIB-status, HDMIB-layout, HDMIB-hooks, HDMIB-port, HDMIB-edid
+//    dmesg | grep HDMIB
 //
 
 #ifndef kern_igfx_hdmib_hpp
