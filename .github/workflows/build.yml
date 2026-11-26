@@ -1,0 +1,55 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  kext:
+    name: WhateverGreen + baked HDMIB
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode
+        run: xcodebuild -version
+
+      - name: Fetch build dependencies
+        run: |
+          set -e
+          git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git deps/MacKernelSDK
+          git clone --depth 1 https://github.com/acidanthera/Lilu.git deps/Lilu
+          cp -R deps/MacKernelSDK deps/Lilu/MacKernelSDK
+          cp -R deps/MacKernelSDK MacKernelSDK
+
+      - name: Build Lilu
+        run: |
+          set -e
+          cd deps/Lilu
+          xcodebuild -project Lilu.xcodeproj -target Lilu -configuration Debug -sdk macosx \
+            ARCHS=x86_64 ONLY_ACTIVE_ARCH=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            build SYMROOT="$PWD/out"
+          cp -R out/Debug/Lilu.kext "$GITHUB_WORKSPACE/Lilu.kext"
+
+      - name: Build WhateverGreen
+        run: |
+          set -e
+          xcodebuild -project WhateverGreen.xcodeproj -target WhateverGreen -configuration Release -sdk macosx \
+            ARCHS=x86_64 ONLY_ACTIVE_ARCH=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            build SYMROOT="$PWD/out"
+          cp -R out/Release/WhateverGreen.kext "$GITHUB_WORKSPACE/WhateverGreen.kext"
+
+      - name: Verify
+        run: |
+          set -e
+          test -f WhateverGreen.kext/Contents/MacOS/WhateverGreen
+          lipo -info WhateverGreen.kext/Contents/MacOS/WhateverGreen
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' WhateverGreen.kext/Contents/Info.plist
+          strings WhateverGreen.kext/Contents/MacOS/WhateverGreen | grep -c 'HDMIB' || true
+          nm -a WhateverGreen.kext/Contents/MacOS/WhateverGreen 2>/dev/null | grep -c HDMIB || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WhateverGreen-kext
+          path: WhateverGreen.kext
+          if-no-files-found: error
