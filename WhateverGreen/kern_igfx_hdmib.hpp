@@ -61,7 +61,6 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
-#include <mach/vm_param.h>          // PAGE_SIZE, same page whatevergreen scans the platform table in
 
 namespace HDMIB {
 
@@ -797,8 +796,8 @@ namespace HDMIB {
 	// Connector table.
 	//
 	// The module needs the HDMI connector to exist in the platform table of the framebuffer kext, because Apple builds its
-	// ports from that table. On platform id 01005C8A the fourth entry is an unused DisplayPort connector on DDI D; the
-	// release builds made the user rewrite exactly six u32 of it through DeviceProperties:
+	// ports from that table. On the Ice Lake LP ids (0x8A5C0001, 0x8A5C0002) the fourth connector is an unused DisplayPort
+	// entry on DDI D; the release builds made the user rewrite exactly six u32 of it through DeviceProperties:
 	//
 	//   framebuffer-patch0-find      03 00 00 00  0a 00 00 00  01 00 00 00  01 00 00 00  00 04 00 00  c1 02 00 00
 	//   framebuffer-patch0-replace   01 00 00 00  02 00 00 00  02 00 00 00  00 00 00 00  00 08 00 00  c1 02 00 00
@@ -808,15 +807,58 @@ namespace HDMIB {
 	// (applyPlatformInformationListPatch, applyDPtoHDMIPatch); the same edit belongs here, where it needs no config.plist.
 	// A user-provided framebuffer patch still wins: if one is present the table is left to WhateverGreen.
 	// ---------------------------------------------------------------------------------------------------------------------
-	static constexpr uint32_t platformIdICLLP = 0x01005C8A;
+	// The table is an array of FramebufferICLLP -- one entry per supported platform id, 280 bytes each -- and on Ice Lake
+	// it is longer than a page: 22 entries, ~6 KB as dumped in WhateverGreen's own manual (10.15/11). WhateverGreen's
+	// findFramebufferId scans a single page, so the ids a retail machine uses sit past the end of that scan: in that dump
+	// 0x8A5C0001 is entry 14 (offset 0xE38) and 0x8A5C0002 is entry 21 (offset 0x15E0), while a page ends at 0x1000. That
+	// is why 0x8A5C0002 was reported as "not in the table" while 0x8A5C0001 worked. Walk the array by entry instead,
+	// bounded by the kext image, so no scan window has to be guessed and nothing outside the kext is ever read.
+	static constexpr size_t maxTableEntries = 64;
 
-	// WhateverGreen's own lookup (kern_igfx.cpp, findFramebufferId): the table is scanned u32-wise over one page, and the
-	// framebuffer id is the first field of every entry.
-	static uint8_t *findPlatformEntry(uint32_t framebufferId, uint8_t *base) {
-		auto p = reinterpret_cast<uint32_t *>(base);
-		auto e = reinterpret_cast<uint32_t *>(base + PAGE_SIZE);
-		while (p < e) { if (*p == framebufferId) return reinterpret_cast<uint8_t *>(p); p++; }
-		return nullptr;
+	// Ice Lake LP table ids: 0x8A5C/0x8A5D/0x8A5A/0x8A5B/0x8A50..8A53/0x8A70/0x8A71, plus 0xFF050000 (the SIM entry).
+	static inline bool isTableId(uint32_t id) {
+		return (id >> 24) == 0x8A || (id >> 24) == 0xFF;
+	}
+
+	// How much an entry looks like the one the reference machine runs: it has to offer a DisplayPort connector on DDI D /
+	// GMBUS pin 10 (the unused port the module turns into HDMI), or at least a DisplayPort connector at all.
+	static int scoreEntry(FramebufferICLLP *f) {
+		int score = 0;
+		for (int i = 0; i < (int)arrsize(f->connectors); i++) {
+			if (static_cast<uint32_t>(f->connectors[i].type) != static_cast<uint32_t>(ConnectorDP)) continue;
+			score = 1;
+			if (f->connectors[i].index == 3 && f->connectors[i].busId == 10) { score = 2; break; }
+		}
+		return score;
+	}
+
+	// Find the entry for the reported platform id. An exact hit wins; otherwise the best-scoring entry is used, because the
+	// driver picks an entry of its own when the id it was given is not in the table.
+	static FramebufferICLLP *findPlatformEntry(uint32_t framebufferId, uint8_t *base, size_t maxBytes, uint32_t *found) {
+		FramebufferICLLP *best = nullptr;
+		int bestScore = -1;
+		uint32_t seen[8] {};
+		uint32_t seenCount = 0, entries = 0;
+		for (size_t off = 0; entries < maxTableEntries && off + sizeof(FramebufferICLLP) <= maxBytes; off += sizeof(FramebufferICLLP)) {
+			auto f = reinterpret_cast<FramebufferICLLP *>(base + off);
+			if (!isTableId(f->framebufferId)) break;              // past the last entry
+			entries++;
+			if (seenCount < arrsize(seen)) seen[seenCount++] = f->framebufferId;
+			if (f->framebufferId == framebufferId) { *found = framebufferId; return f; }
+			int score = scoreEntry(f);
+			if (score > bestScore) { bestScore = score; best = f; }
+		}
+		if (entries > 0 && entries < 3)
+			HLOG_ALWAYS("only %u entries walked: the platform table layout may differ in this macOS build", entries);
+		if (!best) {
+			HLOG_ALWAYS("%u entries walked, none of them Ice Lake LP: HDMI connector entry not created", entries);
+			return nullptr;
+		}
+		*found = best->framebufferId;
+		HLOG_ALWAYS("platform id 0x%08X is not among the %u entries, using 0x%08X instead", framebufferId, entries, *found);
+		HLOG_ALWAYS("entries: 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X",
+		            seen[0], seen[1], seen[2], seen[3], seen[4], seen[5], seen[6], seen[7]);
+		return best;
 	}
 
 	static bool patchConnectorEntry(uint32_t platformId, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -826,9 +868,19 @@ namespace HDMIB {
 			HLOG_ALWAYS("no _gPlatformInformationList: HDMI connector entry not created");
 			return false;
 		}
-		auto frame = reinterpret_cast<FramebufferICLLP *>(findPlatformEntry(platformId, static_cast<uint8_t *>(list)));
+		// The walk is bounded by the kext image, not by a fixed window: the table is ~6 KB on Ice Lake and a page only
+		// reaches its 14th entry.
+		uintptr_t listAddr = reinterpret_cast<uintptr_t>(list);
+		uintptr_t kextEnd  = address + size;
+		size_t maxBytes = kextEnd > listAddr ? (size_t)(kextEnd - listAddr) : 0;
+		if (maxBytes < sizeof(FramebufferICLLP) * 4) {   // the image range looks wrong: do not walk past the symbol page
+			HLOG_ALWAYS("kext range leaves only %u bytes after the table symbol, walking 4 entries", (unsigned)maxBytes);
+			maxBytes = sizeof(FramebufferICLLP) * 4;
+		}
+		uint32_t entryId = 0;
+		auto frame = findPlatformEntry(platformId, static_cast<uint8_t *>(list), maxBytes, &entryId);
 		if (!frame) {
-			HLOG_ALWAYS("platform id 0x%08X is not in the table: HDMI connector entry not created", platformId);
+			HLOG_ALWAYS("platform id 0x%08X not resolved: HDMI connector entry not created", platformId);
 			return false;
 		}
 
@@ -842,17 +894,38 @@ namespace HDMIB {
 				if (frame->connectors[i].index == 3 && frame->connectors[i].busId == 10) break;
 			}
 		}
+
+		// A table that already has a live connector on the target DDI must not get a second one -- the driver keys its
+		// ports by DDI, so two entries would fight over it. That existing connector is the one to turn into HDMI, and it
+		// keeps the pipe and GMBUS pin the platform gave it.
+		bool reuse = false;
+		for (int i = 0; i < (int)arrsize(frame->connectors); i++) {
+			if (i == slot || frame->connectors[i].index != tddi) continue;
+			uint32_t t = static_cast<uint32_t>(frame->connectors[i].type);
+			if (t == 0) continue;
+			if (t & static_cast<uint32_t>(ConnectorHDMI)) {
+				HLOG_ALWAYS("connector %d on 0x%08X already is the HDMI port on ddi %u: nothing to do", i, entryId, tddi);
+				return true;
+			}
+			HLOG_ALWAYS("ddi %u is already used by connector %d on 0x%08X (type=0x%x): converting that one", tddi, i, entryId, t);
+			slot = i;
+			reuse = true;
+			break;
+		}
 		if (slot < 0) {
-			HLOG_ALWAYS("platform id 0x%08X has no free DP connector to convert", platformId);
+			HLOG_ALWAYS("platform id 0x%08X has no free DP connector to convert", entryId);
 			return false;
 		}
 
-		HLOG_ALWAYS("connector %d on 0x%08X: ddi=%u gmbus=%u pipe=%u pad=%u type=0x%x -> ddi=%u gmbus=%u pipe=2 pad=0 type=0x800 (HDMI)",
-		            slot, platformId, frame->connectors[slot].index, frame->connectors[slot].busId, frame->connectors[slot].pipe,
-		            frame->connectors[slot].pad, static_cast<uint32_t>(frame->connectors[slot].type), tddi, tddi + 1);
-		frame->connectors[slot].index = tddi;                 // DDI B on the reference machine
-		frame->connectors[slot].busId = tddi + 1;             // GMBUS pin pair: DDI A/B/C -> 1/2/3
-		frame->connectors[slot].pipe  = 2;                    // pipe B
+		uint32_t nIndex = reuse ? frame->connectors[slot].index : tddi;
+		uint32_t nGmbus = reuse ? frame->connectors[slot].busId : tddi + 1;   // GMBUS pin pair: DDI A/B/C -> 1/2/3
+		uint32_t nPipe  = reuse ? frame->connectors[slot].pipe  : 2;          // pipe B on the reference machine
+		HLOG_ALWAYS("connector %d on 0x%08X: ddi=%u gmbus=%u pipe=%u pad=%u type=0x%x -> ddi=%u gmbus=%u pipe=%u pad=0 type=0x800 (HDMI)",
+		            slot, entryId, frame->connectors[slot].index, frame->connectors[slot].busId, frame->connectors[slot].pipe,
+		            frame->connectors[slot].pad, static_cast<uint32_t>(frame->connectors[slot].type), nIndex, nGmbus, nPipe);
+		frame->connectors[slot].index = nIndex;
+		frame->connectors[slot].busId = nGmbus;
+		frame->connectors[slot].pipe  = nPipe;
 		frame->connectors[slot].pad   = 0;
 		frame->connectors[slot].type  = ConnectorHDMI;        // 0x800: this is what isTarget() looks for
 		return true;
@@ -914,7 +987,7 @@ namespace HDMIB {
 		if (framebufferPatched)
 			HLOG_ALWAYS("a framebuffer patch is configured: leaving the connector table to WhateverGreen");
 		else
-			patchConnectorEntry(platformId ? platformId : platformIdICLLP, patcher, index, address, size);
+			patchConnectorEntry(platformId, patcher, index, address, size);
 
 		auto solve = [&](const char *sym) { return patcher.solveSymbol(index, sym, address, size); };
 		auto gp = solve("__ZN14AppleIntelPort12getPortByDDIEj");
