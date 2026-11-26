@@ -820,14 +820,14 @@ namespace HDMIB {
 		return (id >> 24) == 0x8A || (id >> 24) == 0xFF;
 	}
 
-	// How much an entry looks like the one the reference machine runs: it has to offer a DisplayPort connector on DDI D /
-	// GMBUS pin 10 (the unused port the module turns into HDMI), or at least a DisplayPort connector at all.
+	// How much an entry resembles the one the reference machine runs: 2 when it offers the free DisplayPort connector
+	// on GMBUS pin 10 (the port the module turns into HDMI), 1 for any free DisplayPort connector, 0 for none.
 	static int scoreEntry(FramebufferICLLP *f) {
 		int score = 0;
 		for (int i = 0; i < (int)arrsize(f->connectors); i++) {
 			if (static_cast<uint32_t>(f->connectors[i].type) != static_cast<uint32_t>(ConnectorDP)) continue;
+			if (f->connectors[i].busId == 10) return 2;
 			score = 1;
-			if (f->connectors[i].index == 3 && f->connectors[i].busId == 10) { score = 2; break; }
 		}
 		return score;
 	}
@@ -837,7 +837,7 @@ namespace HDMIB {
 	static FramebufferICLLP *findPlatformEntry(uint32_t framebufferId, uint8_t *base, size_t maxBytes, uint32_t *found) {
 		FramebufferICLLP *best = nullptr;
 		int bestScore = -1;
-		uint32_t seen[8] {};
+		uint32_t seen[24] {};                                     // enough for every Ice Lake entry, not just the first few
 		uint32_t seenCount = 0, entries = 0;
 		for (size_t off = 0; entries < maxTableEntries && off + sizeof(FramebufferICLLP) <= maxBytes; off += sizeof(FramebufferICLLP)) {
 			auto f = reinterpret_cast<FramebufferICLLP *>(base + off);
@@ -856,8 +856,10 @@ namespace HDMIB {
 		}
 		*found = best->framebufferId;
 		HLOG_ALWAYS("platform id 0x%08X is not among the %u entries, using 0x%08X instead", framebufferId, entries, *found);
-		HLOG_ALWAYS("entries: 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X",
-		            seen[0], seen[1], seen[2], seen[3], seen[4], seen[5], seen[6], seen[7]);
+		// Every id that was walked, one per line: the entry the module needs may be past the twentieth, so a fixed
+		// number of ids in one log line would hide exactly the one to look for.
+		for (uint32_t i = 0; i < seenCount; i++)
+			HLOG_ALWAYS("table entry %2u: 0x%08X%s", i, seen[i], seen[i] == *found ? "   <- used" : "");
 		return best;
 	}
 
@@ -871,11 +873,10 @@ namespace HDMIB {
 		// The walk is bounded by the kext image, not by a fixed window: the table is ~6 KB on Ice Lake and a page only
 		// reaches its 14th entry.
 		uintptr_t listAddr = reinterpret_cast<uintptr_t>(list);
-		uintptr_t kextEnd  = address + size;
-		size_t maxBytes = kextEnd > listAddr ? (size_t)(kextEnd - listAddr) : 0;
-		if (maxBytes < sizeof(FramebufferICLLP) * 4) {   // the image range looks wrong: do not walk past the symbol page
-			HLOG_ALWAYS("kext range leaves only %u bytes after the table symbol, walking 4 entries", (unsigned)maxBytes);
+		size_t maxBytes = address + size > listAddr ? (size_t)(address + size - listAddr) : 0;
+		if (maxBytes < sizeof(FramebufferICLLP) * 4) {          // the range looks wrong: stay within 4 entries
 			maxBytes = sizeof(FramebufferICLLP) * 4;
+			HLOG_ALWAYS("kext range ends at the table symbol: walking 4 entries only");
 		}
 		uint32_t entryId = 0;
 		auto frame = findPlatformEntry(platformId, static_cast<uint8_t *>(list), maxBytes, &entryId);
@@ -884,36 +885,33 @@ namespace HDMIB {
 			return false;
 		}
 
-		// Prefer the entry the reference machine has (DDI D, GMBUS pin 10); otherwise take the last DP entry, which is
-		// the unused one on every Ice Lake LP table. Members are accessed directly (no reference or pointer to a packed
-		// member), which keeps -Waddress-of-packed-member quiet.
-		int slot = -1;
+		// One pass over the connectors. The driver keys its ports by DDI, so an empty slot on the target DDI is the
+		// cleanest place for the HDMI port, and a live connector there is converted in place -- it keeps the pipe and
+		// GMBUS pin the platform gave it, and a second connector on the same DDI would only fight it. Otherwise the
+		// reference machine's free port (DDI D / GMBUS pin 10) is used, then the last free DisplayPort connector.
+		// Members are accessed directly (no reference or pointer to a packed member), which keeps
+		// -Waddress-of-packed-member quiet.
+		int dp = -1, ref = -1, empty = -1, live = -1;
 		for (int i = 0; i < (int)arrsize(frame->connectors); i++) {
-			if (static_cast<uint32_t>(frame->connectors[i].type) == static_cast<uint32_t>(ConnectorDP)) {
-				slot = i;
-				if (frame->connectors[i].index == 3 && frame->connectors[i].busId == 10) break;
-			}
-		}
-
-		// A table that already has a live connector on the target DDI must not get a second one -- the driver keys its
-		// ports by DDI, so two entries would fight over it. That existing connector is the one to turn into HDMI, and it
-		// keeps the pipe and GMBUS pin the platform gave it.
-		bool reuse = false;
-		for (int i = 0; i < (int)arrsize(frame->connectors); i++) {
-			if (i == slot || frame->connectors[i].index != tddi) continue;
 			uint32_t t = static_cast<uint32_t>(frame->connectors[i].type);
-			if (t == 0) continue;
+			bool onTarget = frame->connectors[i].index == tddi;
+			if (t == 0) { if (onTarget && empty < 0) empty = i; continue; }
 			if (t & static_cast<uint32_t>(ConnectorHDMI)) {
-				HLOG_ALWAYS("connector %d on 0x%08X already is the HDMI port on ddi %u: nothing to do", i, entryId, tddi);
-				return true;
+				if (onTarget) {
+					HLOG_ALWAYS("connector %d on 0x%08X already is the HDMI port on ddi %u: nothing to do", i, entryId, tddi);
+					return true;
+				}
+				continue;
 			}
-			HLOG_ALWAYS("ddi %u is already used by connector %d on 0x%08X (type=0x%x): converting that one", tddi, i, entryId, t);
-			slot = i;
-			reuse = true;
-			break;
+			if (onTarget) { if (live < 0) live = i; continue; }
+			if (t != static_cast<uint32_t>(ConnectorDP)) continue;
+			dp = i;
+			if (frame->connectors[i].busId == 10) ref = i;
 		}
+		int slot = empty >= 0 ? empty : (live >= 0 ? live : (ref >= 0 ? ref : dp));
+		bool reuse = slot >= 0 && slot == live;
 		if (slot < 0) {
-			HLOG_ALWAYS("platform id 0x%08X has no free DP connector to convert", entryId);
+			HLOG_ALWAYS("platform id 0x%08X has no connector left to convert", entryId);
 			return false;
 		}
 
