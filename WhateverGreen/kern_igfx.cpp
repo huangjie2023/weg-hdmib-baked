@@ -10,6 +10,7 @@
 #include "kern_guc.hpp"
 #include "kern_agdc.hpp"
 #include "kern_igfx_kexts.hpp"
+#include "kern_igfx_hdmib.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_cpu.hpp>
@@ -209,6 +210,13 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 		bool nohdmi = info->videoBuiltin->getProperty("disable-hdmi-patches") != nullptr;
 		hdmiAutopatch = !applyFramebufferPatch && !connectorLessFrame && getKernelVersion() >= Yosemite &&
 			cpuGeneration >= CPUInfo::CpuGeneration::SandyBridge && !checkKernelArgument("-igfxnohdmi") && !nohdmi;
+
+		// The baked HDMIB module rewrites exactly one connector entry of the Ice Lake LP table (see
+		// kern_igfx_hdmib.hpp, patchConnectorEntry). The autopatch turns *every* DP connector into HDMI, which would
+		// both undo that precision and change unrelated ports (USB-C / DDI), and it could leave two connectors with
+		// the same index. Whichever of the two runs, only one may own the table.
+		if (hdmiAutopatch && cpuGeneration == CPUInfo::CpuGeneration::IceLake && HDMIB::enabled())
+			hdmiAutopatch = false;
 		
 		// Set AAPL00,DualLink to zero on Westmere if applying single link patches.
 		if (cpuGeneration == CPUInfo::CpuGeneration::Westmere && framebufferWestmerePatches.SingleLink) {
@@ -237,6 +245,10 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 		// Ideally, we could get rid of these two lambda expressions
 		auto requiresFramebufferPatches = [this]() {
 			if (applyFramebufferPatch || hdmiAutopatch)
+				return true;
+			// The baked HDMIB module patches the framebuffer kext itself, so the kext has to be kept on even when
+			// nothing else asks for patches (it used to stay on only because of the autopatch above).
+			if (HDMIB::enabled() && BaseDeviceInfo::get().cpuGeneration == CPUInfo::CpuGeneration::IceLake)
 				return true;
 			if (dumpFramebufferToDisk || dumpPlatformTable)
 				return true;
@@ -342,6 +354,12 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 		for (auto submodule : submodules)
 			if (submodule->enabled)
 				submodule->processFramebufferKext(patcher, index, address, size);
+
+		// HDMI on DDI B for Ice Lake LP. Baked into the driver: no boot argument is required and the connector entry is
+		// written into the platform table below, so no DeviceProperties patch is needed either. It returns immediately
+		// for any other framebuffer kext, and it hands the connector table back to WhateverGreen when the user has
+		// configured a framebuffer patch of their own.
+		HDMIB::install(patcher, index, address, size, framebufferPatch.framebufferId, applyFramebufferPatch);
 
 		if (applyFramebufferPatch || dumpFramebufferToDisk || dumpPlatformTable || hdmiAutopatch) {
 			framebufferStart = reinterpret_cast<uint8_t *>(address);
