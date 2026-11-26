@@ -222,18 +222,15 @@ namespace HDMIB {
 		}
 	}
 
+	// 0x800 = HDMI connector type: a real DP port on this DDI is never touched.
 	static inline bool isTarget(void *port) {
 		auto c = configOf(port);
-		// 0x800 = HDMI connector type: a real DP port on this DDI is never touched
 		return c && c->index == tddi && (static_cast<uint32_t>(c->type) & static_cast<uint32_t>(ConnectorHDMI));
 	}
 	static inline bool isTargetFb(void *fb) { return L && ptrOk(fb) && rd<uint32_t>(fb, L->fbIndex) == (uint32_t)fbIdx; }
 
-	// Apple keeps power wells 2 and 3 down while only the internal panel is lit; GMBUS and DDI B need them.
-	// Well n has STATE at bit 2n and REQUEST at bit 2n+1 (PW1..PW3 -> states 0x15, requests 0x2a).
-	// The release builds tested `(v & 0x3f) != 0x3f` here, a value the write below can never produce, so the early-out
-	// was dead and the register was rewritten on every call — including during wake, where hj38 removed this function
-	// from the DDC path for exactly that reason. The state bits are what the wait loop already checks; use them.
+	// Well n has STATE at bit 2n and REQUEST at bit 2n+1 (PW1..PW3 -> states 0x15, requests 0x2a). The release builds
+	// tested (v & 0x3f) != 0x3f, which the write below can never produce, so their early-out was dead.
 	static void ensurePW() {
 		if (!gCtl || !readReg || !writeReg) return;
 		uint32_t v = readReg(gCtl, REG_PWR_WELL_CTL2);
@@ -807,60 +804,20 @@ namespace HDMIB {
 	// (applyPlatformInformationListPatch, applyDPtoHDMIPatch); the same edit belongs here, where it needs no config.plist.
 	// A user-provided framebuffer patch still wins: if one is present the table is left to WhateverGreen.
 	// ---------------------------------------------------------------------------------------------------------------------
-	// The table is an array of FramebufferICLLP -- one entry per supported platform id, 280 bytes each -- and on Ice Lake
-	// it is longer than a page: 22 entries, ~6 KB as dumped in WhateverGreen's own manual (10.15/11). WhateverGreen's
-	// findFramebufferId scans a single page, so the ids a retail machine uses sit past the end of that scan: in that dump
-	// 0x8A5C0001 is entry 14 (offset 0xE38) and 0x8A5C0002 is entry 21 (offset 0x15E0), while a page ends at 0x1000. That
-	// is why 0x8A5C0002 was reported as "not in the table" while 0x8A5C0001 worked. Walk the array by entry instead,
-	// bounded by the kext image, so no scan window has to be guessed and nothing outside the kext is ever read.
-	static constexpr size_t maxTableEntries = 64;
-
-	// Ice Lake LP table ids: 0x8A5C/0x8A5D/0x8A5A/0x8A5B/0x8A50..8A53/0x8A70/0x8A71, plus 0xFF050000 (the SIM entry).
-	static inline bool isTableId(uint32_t id) {
-		return (id >> 24) == 0x8A || (id >> 24) == 0xFF;
-	}
-
-	// How much an entry resembles the one the reference machine runs: 2 when it offers the free DisplayPort connector
-	// on GMBUS pin 10 (the port the module turns into HDMI), 1 for any free DisplayPort connector, 0 for none.
-	static int scoreEntry(FramebufferICLLP *f) {
-		int score = 0;
-		for (int i = 0; i < (int)arrsize(f->connectors); i++) {
-			if (static_cast<uint32_t>(f->connectors[i].type) != static_cast<uint32_t>(ConnectorDP)) continue;
-			if (f->connectors[i].busId == 10) return 2;
-			score = 1;
-		}
-		return score;
-	}
-
-	// Find the entry for the reported platform id. An exact hit wins; otherwise the best-scoring entry is used, because the
-	// driver picks an entry of its own when the id it was given is not in the table.
-	static FramebufferICLLP *findPlatformEntry(uint32_t framebufferId, uint8_t *base, size_t maxBytes, uint32_t *found) {
-		FramebufferICLLP *best = nullptr;
-		int bestScore = -1;
-		uint32_t seen[24] {};                                     // enough for every Ice Lake entry, not just the first few
-		uint32_t seenCount = 0, entries = 0;
-		for (size_t off = 0; entries < maxTableEntries && off + sizeof(FramebufferICLLP) <= maxBytes; off += sizeof(FramebufferICLLP)) {
+	// The table is an array of FramebufferICLLP, 280 bytes per entry, 23 entries on Ice Lake (6440 bytes as dumped in
+	// WhateverGreen's own manual). WhateverGreen's findFramebufferId only scans PAGE_SIZE = 0x1000, which ends at the
+	// 15th entry -- so 0x8A5C0001 (14th, 0xE38) was found while 0x8A510002 (20th, 0x14C8) and 0x8A5C0002 (21st,
+	// 0x15E0) were reported as "not in the table". Walk by entry instead, bounded by the kext image.
+	// Ice Lake ids are 0x8A/0xFF-prefixed (0x8A51/52/53/5A/5B/5C/5D/70/71, plus 0xFF050000 for the SIM entry), so the
+	// first id that is not marks the end of the table.
+	static FramebufferICLLP *findPlatformEntry(uint32_t framebufferId, uint8_t *base, size_t maxBytes) {
+		for (size_t off = 0; off + sizeof(FramebufferICLLP) <= maxBytes; off += sizeof(FramebufferICLLP)) {
 			auto f = reinterpret_cast<FramebufferICLLP *>(base + off);
-			if (!isTableId(f->framebufferId)) break;              // past the last entry
-			entries++;
-			if (seenCount < arrsize(seen)) seen[seenCount++] = f->framebufferId;
-			if (f->framebufferId == framebufferId) { *found = framebufferId; return f; }
-			int score = scoreEntry(f);
-			if (score > bestScore) { bestScore = score; best = f; }
+			if (f->framebufferId == framebufferId) return f;
+			if ((f->framebufferId >> 24) != 0x8A && (f->framebufferId >> 24) != 0xFF) break;
 		}
-		if (entries > 0 && entries < 3)
-			HLOG_ALWAYS("only %u entries walked: the platform table layout may differ in this macOS build", entries);
-		if (!best) {
-			HLOG_ALWAYS("%u entries walked, none of them Ice Lake LP: HDMI connector entry not created", entries);
-			return nullptr;
-		}
-		*found = best->framebufferId;
-		HLOG_ALWAYS("platform id 0x%08X is not among the %u entries, using 0x%08X instead", framebufferId, entries, *found);
-		// Every id that was walked, one per line: the entry the module needs may be past the twentieth, so a fixed
-		// number of ids in one log line would hide exactly the one to look for.
-		for (uint32_t i = 0; i < seenCount; i++)
-			HLOG_ALWAYS("table entry %2u: 0x%08X%s", i, seen[i], seen[i] == *found ? "   <- used" : "");
-		return best;
+		HLOG_ALWAYS("platform id 0x%08X is not in this build's table: no connector entry created", framebufferId);
+		return nullptr;
 	}
 
 	static bool patchConnectorEntry(uint32_t platformId, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -870,27 +827,18 @@ namespace HDMIB {
 			HLOG_ALWAYS("no _gPlatformInformationList: HDMI connector entry not created");
 			return false;
 		}
-		// The walk is bounded by the kext image, not by a fixed window: the table is ~6 KB on Ice Lake and a page only
-		// reaches its 14th entry.
-		uintptr_t listAddr = reinterpret_cast<uintptr_t>(list);
-		size_t maxBytes = address + size > listAddr ? (size_t)(address + size - listAddr) : 0;
-		if (maxBytes < sizeof(FramebufferICLLP) * 4) {          // the range looks wrong: stay within 4 entries
-			maxBytes = sizeof(FramebufferICLLP) * 4;
-			HLOG_ALWAYS("kext range ends at the table symbol: walking 4 entries only");
-		}
-		uint32_t entryId = 0;
-		auto frame = findPlatformEntry(platformId, static_cast<uint8_t *>(list), maxBytes, &entryId);
-		if (!frame) {
-			HLOG_ALWAYS("platform id 0x%08X not resolved: HDMI connector entry not created", platformId);
-			return false;
-		}
+		auto listAddr = reinterpret_cast<uintptr_t>(list);
+		auto frame = listAddr < address + size
+		           ? findPlatformEntry(platformId, static_cast<uint8_t *>(list), (size_t)(address + size - listAddr))
+		           : nullptr;
+		if (!frame) return false;
 
 		// One pass over the connectors. The driver keys its ports by DDI, so an empty slot on the target DDI is the
-		// cleanest place for the HDMI port, and a live connector there is converted in place -- it keeps the pipe and
-		// GMBUS pin the platform gave it, and a second connector on the same DDI would only fight it. Otherwise the
-		// reference machine's free port (DDI D / GMBUS pin 10) is used, then the last free DisplayPort connector.
-		// Members are accessed directly (no reference or pointer to a packed member), which keeps
-		// -Waddress-of-packed-member quiet.
+		// cleanest place for the HDMI port, and a DisplayPort connector there is converted in place -- it keeps the pipe
+		// and GMBUS pin the platform gave it, and a second connector on the same DDI would only fight it. Anything else
+		// on the target DDI (LVDS, DVI) is left alone. Otherwise the reference machine's free port (GMBUS pin 10) is
+		// used, then the last free DisplayPort connector. Members are accessed directly (no reference or pointer to a
+		// packed member), which keeps -Waddress-of-packed-member quiet.
 		int dp = -1, ref = -1, empty = -1, live = -1;
 		for (int i = 0; i < (int)arrsize(frame->connectors); i++) {
 			uint32_t t = static_cast<uint32_t>(frame->connectors[i].type);
@@ -898,20 +846,20 @@ namespace HDMIB {
 			if (t == 0) { if (onTarget && empty < 0) empty = i; continue; }
 			if (t & static_cast<uint32_t>(ConnectorHDMI)) {
 				if (onTarget) {
-					HLOG_ALWAYS("connector %d on 0x%08X already is the HDMI port on ddi %u: nothing to do", i, entryId, tddi);
+					HLOG_ALWAYS("connector %d on 0x%08X already is the HDMI port on ddi %u: nothing to do", i, platformId, tddi);
 					return true;
 				}
 				continue;
 			}
-			if (onTarget) { if (live < 0) live = i; continue; }
 			if (t != static_cast<uint32_t>(ConnectorDP)) continue;
+			if (onTarget) { if (live < 0) live = i; continue; }
 			dp = i;
 			if (frame->connectors[i].busId == 10) ref = i;
 		}
 		int slot = empty >= 0 ? empty : (live >= 0 ? live : (ref >= 0 ? ref : dp));
 		bool reuse = slot >= 0 && slot == live;
 		if (slot < 0) {
-			HLOG_ALWAYS("platform id 0x%08X has no connector left to convert", entryId);
+			HLOG_ALWAYS("platform id 0x%08X has no connector left to convert", platformId);
 			return false;
 		}
 
@@ -919,7 +867,7 @@ namespace HDMIB {
 		uint32_t nGmbus = reuse ? frame->connectors[slot].busId : tddi + 1;   // GMBUS pin pair: DDI A/B/C -> 1/2/3
 		uint32_t nPipe  = reuse ? frame->connectors[slot].pipe  : 2;          // pipe B on the reference machine
 		HLOG_ALWAYS("connector %d on 0x%08X: ddi=%u gmbus=%u pipe=%u pad=%u type=0x%x -> ddi=%u gmbus=%u pipe=%u pad=0 type=0x800 (HDMI)",
-		            slot, entryId, frame->connectors[slot].index, frame->connectors[slot].busId, frame->connectors[slot].pipe,
+		            slot, platformId, frame->connectors[slot].index, frame->connectors[slot].busId, frame->connectors[slot].pipe,
 		            frame->connectors[slot].pad, static_cast<uint32_t>(frame->connectors[slot].type), nIndex, nGmbus, nPipe);
 		frame->connectors[slot].index = nIndex;
 		frame->connectors[slot].busId = nGmbus;

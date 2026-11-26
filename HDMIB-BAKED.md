@@ -49,29 +49,33 @@ HDMIB-status  = hotplugs=1 edid-ok=1 ... vrr-off=1 port-fixups=0 ...
 
 `HDMIB-port ... OK (HDMI)` means the baked connector entry landed. If it says `NOT HDMI`, look for the
 `HDMIB: connector N on <id>: ...` line in `dmesg | grep HDMIB` — it names the entry that was
-converted, or explains why none was (`platform id ... not resolved`, `no _gPlatformInformationList`).
-The walk itself is visible: `HDMIB: platform id 0x... is not among the 22 entries` plus the list of ids it saw.
+converted, or explains why none was (`platform id ... is not in this build's table`, `no _gPlatformInformationList`).
 
 ## Platform ids
 
-The table is an array of 280-byte entries, one per platform id, and on Ice Lake it holds 22 of them (~6 KB, as
-dumped in WhateverGreen's manual for 10.15/11). WhateverGreen's own lookup (`findFramebufferId`) scans a single page
-(4 KB), which ends at entry 14: in that dump `0x8A5C0001` is entry 14 (offset 0xE38, inside the page) while
-`0x8A5C0002` is entry 21 (offset 0x15E0, past it). That is why `0x8A5C0002` was reported as "not in the table"
-while `0x8A5C0001` worked -- a scan window, not an id.
+The table is an array of 280-byte entries and holds **23** of them on Ice Lake (6440 bytes, as dumped in
+WhateverGreen's manual). WhateverGreen's own lookup (`findFramebufferId`) scans a single page (4 KB), which ends
+inside entry 15, so only the first 14 ids are reachable through it:
 
-The module walks the array entry by entry instead, bounded by the kext image, so the id only has to exist:
+| id | entry | offset | reachable by a 4 KB scan? |
+|---|---|---|---|
+| `0x8A5C0001` | 14 | 0x0E38 | yes |
+| `0x8A510002` | 20 | 0x14C8 | **no** |
+| `0x8A5C0002` | 21 | 0x15E0 | **no** |
+
+That, not the id itself, is why `0x8A5C0002` and `0x8A510002` were reported as "not in the table". The module walks
+the array by entry instead (stride `sizeof(FramebufferICLLP)`, bounded by the kext image), so any id the build
+ships is found:
 
 | `AAPL,ig-platform-id` | result |
 |---|---|
-| `0x8A5C0002` (`02005C8A` as data), the retail MacBookAir9,1 path | entry 21 patched: `[3] busId 0x0A DP` -> `ddi 1 gmbus 2 pipe 2 HDMI` |
-| `0x8A5C0001` (`01005C8A` as data) | entry 14 patched, same connector |
-| not in the table at all | the driver works from an entry of its own, so the module takes the Ice Lake LP entry that has a DP connector on DDI D / GMBUS 10 (else the first one with a DP connector) and logs every id it walked |
+| `0x8A510002` / `0x8A5C0002` / `0x8A5C0001` / any other shipped id | its own entry is patched |
+| anything this build does not ship | `HDMIB: platform id 0x... is not in this build's table` and the module stays idle |
 
-If the chosen entry already carries a live connector on the target DDI (it does not on `0x8A5C0001`/`0x8A5C0002`,
-both are `[0] LVDS, [2] bus 9, [3] bus 10`), the module converts *that* connector instead of creating a second one
-on the same DDI, keeping the pipe/GMBUS pin the platform assigned. The log then reads
-`ddi 1 is already used by connector N on 0x... (type=0x400): converting that one`.
+The connector it picks: an empty slot on the target DDI first (nothing to rewrite), then a DisplayPort connector
+already on that DDI (converted in place, keeping the pipe and GMBUS pin the platform gave it -- the driver keys its
+ports by DDI, so a second one there would fight it), then the reference machine's free port on GMBUS pin 10, then
+the last free DisplayPort connector. LVDS and DVI entries are never touched.
 
 ## Boot arguments
 
