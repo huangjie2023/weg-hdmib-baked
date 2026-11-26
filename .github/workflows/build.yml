@@ -39,6 +39,12 @@ jobs:
             build SYMROOT="$PWD/out"
           cp -R out/Release/WhateverGreen.kext "$GITHUB_WORKSPACE/WhateverGreen.kext"
 
+      - name: Ad-hoc sign
+        run: |
+          set -e
+          codesign --force --deep --sign - WhateverGreen.kext
+          codesign -dv WhateverGreen.kext 2>&1 | head -6
+
       - name: Verify
         run: |
           set -e
@@ -46,7 +52,8 @@ jobs:
           lipo -info WhateverGreen.kext/Contents/MacOS/WhateverGreen
           /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' WhateverGreen.kext/Contents/Info.plist
           strings WhateverGreen.kext/Contents/MacOS/WhateverGreen | grep -c 'HDMIB' || true
-          nm -a WhateverGreen.kext/Contents/MacOS/WhateverGreen 2>/dev/null | grep -c HDMIB || true
+          strings WhateverGreen.kext/Contents/MacOS/WhateverGreen | grep -c '1.0-hj39-baked' || true
+          codesign -v WhateverGreen.kext && echo "signature ok"
 
       - uses: actions/upload-artifact@v4
         with:
