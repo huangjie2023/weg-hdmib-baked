@@ -1,7 +1,7 @@
 # HDMIB, baked into WhateverGreen
 
 This tree is upstream WhateverGreen `093e76f` (2026-09-27) plus the Ice Lake HDMI-on-DDI-B module
-written *into* the driver. Base: the module's `1.0-hj39` state.
+written *into* the driver. Base: the module's `1.0-hj40` state.
 
 What changed compared with the module's own release builds:
 
@@ -9,8 +9,8 @@ What changed compared with the module's own release builds:
 |---|---|---|
 | Where the code lives | `kern_igfx_hdmib.hpp` copied in by a script, `kern_igfx.cpp` edited with `perl -pi` | `WhateverGreen/kern_igfx_hdmib.hpp`, `kern_igfx.cpp` edited in the source, committed |
 | Enable | boot-arg `-igfxhdmib` (nothing happens without it) | always active on the Ice Lake LP framebuffer; `igfxhdmib-off=1` disables |
-| HDMI connector entry | `framebuffer-patch0-find/-replace` in `config.plist` | written into the platform table at kext load (`patchConnectorEntry`, entry walked by strided scan) |
-| WhateverGreen's own DP→HDMI autopatch | silently disabled by the presence of `framebuffer-patch0` | disabled explicitly while the module owns the table |
+| HDMI connector entry | `framebuffer-patch0-find/-replace` in `config.plist` | written into the platform table at kext load (`patchConnectorEntry`, 8 KB value scan, no struct layout dependency) |
+| WhateverGreen's own DP→HDMI autopatch | silently disabled by the presence of `framebuffer-patch0` | disabled explicitly; the module always owns the table |
 | Kext name | `WhateverGreen-HDMIB.kext` | `WhateverGreen-baked.kext` (same bundle id, install it *as* `WhateverGreen.kext`) |
 
 ## Build
@@ -29,8 +29,7 @@ Lilu and MacKernelSDK; it edits nothing.
    never keep both, the bundle id is the same).
 2. `Kernel → Add` entry unchanged.
 3. Remove `framebuffer-patch0-enable/-find/-replace` from the iGPU `DeviceProperties`. They are no longer
-   needed; leaving them in is harmless (the module then steps aside and lets WhateverGreen apply them),
-   but they are dead weight and will fail to match once the module has done its job in a future build.
+   needed; leaving them in is harmless — the module now always writes the table itself.
 4. `boot-args`: `-igfxhdmib` can be deleted. Everything else stays.
 
 ## Verify
@@ -40,7 +39,7 @@ ioreg -l | grep HDMIB
 ```
 
 ```
-HDMIB-version = 1.0-hj39-baked
+HDMIB-version = 1.0-hj40-baked
 HDMIB-layout  = macOS 26 (Tahoe)
 HDMIB-hooks   = installed
 HDMIB-port    = ddi=1 gmbus=2 class=2 type=0x800 flags=0x2c1 OK (HDMI)
@@ -63,16 +62,19 @@ inside entry 15, so only the first 14 ids are reachable through it:
 | `0x8A510002` | 20 | 0x14C8 | **no** |
 | `0x8A5C0002` | 21 | 0x15E0 | **no** |
 
-That, not the id itself, is why `0x8A5C0002` and `0x8A510002` were reported as "not in the table". The module walks
-the array by entry instead (stride `sizeof(FramebufferICLLP)`, bounded by the kext image), so any id the build
-ships is found:
+That, not the id itself, is why `0x8A5C0002` and `0x8A510002` were reported as "not in the table". The module scans
+the first 8 KB of `_gPlatformInformationList` by value: it converts the unused GMBUS-pin-10 DisplayPort connector
+(the exact six-u32 group the old `framebuffer-patch0` rewrote), with no dependency on the `FramebufferICLLP` struct
+layout or the kext image bounds. It looks for the configured id first, then patches every matching connector so an
+id outside the table is still covered:
 
 | `AAPL,ig-platform-id` | result |
 |---|---|
 | `0x8A510002` / `0x8A5C0002` / `0x8A5C0001` / any other shipped id | its own entry is patched |
-| anything this build does not ship | `HDMIB: platform id 0x... is not in this build's table` and the module stays idle |
+| anything this build does not ship | every matching connector in the table is patched |
 
-The connector it picks: an empty slot on the target DDI first (nothing to rewrite), then a DisplayPort connector
+The connector it picks: the unused DisplayPort connector on GMBUS pin 10, rewritten to the reference machine's
+HDMI-on-DDI-B values (ddi=1, gmbus=2, pipe=2, type=0x800).
 already on that DDI (converted in place, keeping the pipe and GMBUS pin the platform gave it -- the driver keys its
 ports by DDI, so a second one there would fight it), then the reference machine's free port on GMBUS pin 10, then
 the last free DisplayPort connector. LVDS and DVI entries are never touched.

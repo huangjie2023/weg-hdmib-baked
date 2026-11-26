@@ -355,11 +355,10 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 			if (submodule->enabled)
 				submodule->processFramebufferKext(patcher, index, address, size);
 
-		// HDMI on DDI B for Ice Lake LP. Baked into the driver: no boot argument is required and the connector entry is
-		// written into the platform table below, so no DeviceProperties patch is needed either. It returns immediately
-		// for any other framebuffer kext, and it hands the connector table back to WhateverGreen when the user has
-		// configured a framebuffer patch of their own.
-		HDMIB::install(patcher, index, address, size, framebufferPatch.framebufferId, applyFramebufferPatch);
+		// HDMI on DDI B for Ice Lake LP. Baked into the driver: no boot argument and no DeviceProperties patch needed.
+		// Returns immediately for any other framebuffer kext. The connector table is always written here, even when
+		// a leftover framebuffer-patch* exists, because WhateverGreen's one-page scan cannot reach id 0x8A5C0002.
+		HDMIB::install(patcher, index, address, size, framebufferPatch.framebufferId);
 
 		if (applyFramebufferPatch || dumpFramebufferToDisk || dumpPlatformTable || hdmiAutopatch) {
 			framebufferStart = reinterpret_cast<uint8_t *>(address);

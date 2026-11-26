@@ -39,7 +39,7 @@
 
 namespace HDMIB {
 
-	static constexpr const char *Version = "1.0-hj39-baked";
+	static constexpr const char *Version = "1.0-hj40-baked";
 
 	// IOLog directly: Lilu's SYSLOG is silent when interrupts are disabled (hotplug paths run that way).
 	#define HLOG(fmt, ...) do { if (ml_get_interrupts_enabled()) IOLog("HDMIB: " fmt "\n", ## __VA_ARGS__); } while (0)
@@ -777,79 +777,69 @@ namespace HDMIB {
 	//
 	// The table itself is writable data in the framebuffer kext, and WhateverGreen already rewrites it in place
 	// (applyPlatformInformationListPatch, applyDPtoHDMIPatch); the same edit belongs here, where it needs no config.plist.
-	// A user-provided framebuffer patch still wins: if one is present the table is left to WhateverGreen.
+	// This edit is unconditional: WhateverGreen's own lookup stops one page into the table and cannot reach 0x8A5C0002.
 	// ---------------------------------------------------------------------------------------------------------------------
-	// The table is an array of FramebufferICLLP, 280 bytes per entry, 23 entries on Ice Lake (6440 bytes as dumped in
-	// WhateverGreen's own manual). WhateverGreen's findFramebufferId only scans PAGE_SIZE = 0x1000, which ends at the
-	// 15th entry -- so 0x8A5C0001 (14th, 0xE38) was found while 0x8A510002 (20th, 0x14C8) and 0x8A5C0002 (21st,
-	// 0x15E0) were reported as "not in the table". Walk by entry instead, bounded by the kext image.
-	// Ice Lake ids are 0x8A/0xFF-prefixed (0x8A51/52/53/5A/5B/5C/5D/70/71, plus 0xFF050000 for the SIM entry), so the
-	// first id that is not marks the end of the table.
-	static FramebufferICLLP *findPlatformEntry(uint32_t framebufferId, uint8_t *base, size_t maxBytes) {
-		for (size_t off = 0; off + sizeof(FramebufferICLLP) <= maxBytes; off += sizeof(FramebufferICLLP)) {
-			auto f = reinterpret_cast<FramebufferICLLP *>(base + off);
-			if (f->framebufferId == framebufferId) return f;
-			if ((f->framebufferId >> 24) != 0x8A && (f->framebufferId >> 24) != 0xFF) break;
+	// WhateverGreen's own lookup (findFramebufferId) scans one page from _gPlatformInformationList, and on Ice Lake the
+	// table is longer than that: 23 entries of 280 bytes, 6440 bytes as dumped in its manual. A page ends at entry 15, so
+	// 0x8A5C0001 (entry 14, offset 0x0E38) is found while 0x8A510002 (entry 20, 0x14C8) and 0x8A5C0002 (entry 21,
+	// 0x15E0) are not -- which is why a config.plist patch cannot reach them and this module writes the table itself.
+	//
+	// Nothing below depends on the entry layout. Inside an entry the connector is the six-u32 group whose second word is
+	// GMBUS pin 10 and whose fifth is ConnectorDP: the unused DisplayPort port on DDI D that both Ice Lake LP tables
+	// carry. Rewriting those six words is exactly what framebuffer-patch0-find/-replace did, so it keeps working on a
+	// macOS that grew the structure around them.
+	static bool patchOneEntry(uint32_t *entry, uint32_t platformId) {
+		for (size_t off = 4; off + 24 <= 0xE8; off += 4) {
+			uint32_t *c = entry + off / 4;
+			if (c[1] != 10 || c[4] != static_cast<uint32_t>(ConnectorDP) || c[0] > 5 || c[3] > 2) continue;
+			HLOG_ALWAYS("connector +0x%02X on 0x%08X: index=%u gmbus=%u pipe=%u pad=%u type=0x%x -> index=%u gmbus=%u pipe=2 pad=0 type=0x800",
+			            (unsigned)off, platformId, c[0], c[1], c[2], c[3], c[4], tddi, tddi + 1);
+			c[0] = tddi;                                   // DDI B on the reference machine
+			c[1] = tddi + 1;                               // GMBUS pin pair: DDI A/B/C -> 1/2/3
+			c[2] = 2;                                      // pipe B
+			c[3] = 0;
+			c[4] = static_cast<uint32_t>(ConnectorHDMI);   // 0x800: what isTarget() looks for
+			return true;
 		}
-		HLOG_ALWAYS("platform id 0x%08X is not in this build's table: no connector entry created", framebufferId);
-		return nullptr;
+		return false;
 	}
 
-	static bool patchConnectorEntry(uint32_t platformId, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
-		auto list = patcher.solveSymbol<void *>(index, "_gPlatformInformationList", address, size);
-		if (!list) {
+	static void patchConnectorEntry(uint32_t platformId, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+		auto base = patcher.solveSymbol<uint8_t *>(index, "_gPlatformInformationList", address, size);
+		if (!base) {
 			patcher.clearError();
-			HLOG_ALWAYS("no _gPlatformInformationList: HDMI connector entry not created");
-			return false;
-		}
-		auto listAddr = reinterpret_cast<uintptr_t>(list);
-		auto frame = listAddr < address + size
-		           ? findPlatformEntry(platformId, static_cast<uint8_t *>(list), (size_t)(address + size - listAddr))
-		           : nullptr;
-		if (!frame) return false;
-
-		// One pass over the connectors. The driver keys its ports by DDI, so an empty slot on the target DDI is the
-		// cleanest place for the HDMI port, and a DisplayPort connector there is converted in place -- it keeps the pipe
-		// and GMBUS pin the platform gave it, and a second connector on the same DDI would only fight it. Anything else
-		// on the target DDI (LVDS, DVI) is left alone. Otherwise the reference machine's free port (GMBUS pin 10) is
-		// used, then the last free DisplayPort connector. Members are accessed directly (no reference or pointer to a
-		// packed member), which keeps -Waddress-of-packed-member quiet.
-		int dp = -1, ref = -1, empty = -1, live = -1;
-		for (int i = 0; i < (int)arrsize(frame->connectors); i++) {
-			uint32_t t = static_cast<uint32_t>(frame->connectors[i].type);
-			bool onTarget = frame->connectors[i].index == tddi;
-			if (t == 0) { if (onTarget && empty < 0) empty = i; continue; }
-			if (t & static_cast<uint32_t>(ConnectorHDMI)) {
-				if (onTarget) {
-					HLOG_ALWAYS("connector %d on 0x%08X already is the HDMI port on ddi %u: nothing to do", i, platformId, tddi);
-					return true;
-				}
-				continue;
-			}
-			if (t != static_cast<uint32_t>(ConnectorDP)) continue;
-			if (onTarget) { if (live < 0) live = i; continue; }
-			dp = i;
-			if (frame->connectors[i].busId == 10) ref = i;
-		}
-		int slot = empty >= 0 ? empty : (live >= 0 ? live : (ref >= 0 ? ref : dp));
-		bool reuse = slot >= 0 && slot == live;
-		if (slot < 0) {
-			HLOG_ALWAYS("platform id 0x%08X has no connector left to convert", platformId);
-			return false;
+			HLOG_ALWAYS("no _gPlatformInformationList: no HDMI connector created");
+			return;
 		}
 
-		uint32_t nIndex = reuse ? frame->connectors[slot].index : tddi;
-		uint32_t nGmbus = reuse ? frame->connectors[slot].busId : tddi + 1;   // GMBUS pin pair: DDI A/B/C -> 1/2/3
-		uint32_t nPipe  = reuse ? frame->connectors[slot].pipe  : 2;          // pipe B on the reference machine
-		HLOG_ALWAYS("connector %d on 0x%08X: ddi=%u gmbus=%u pipe=%u pad=%u type=0x%x -> ddi=%u gmbus=%u pipe=%u pad=0 type=0x800 (HDMI)",
-		            slot, platformId, frame->connectors[slot].index, frame->connectors[slot].busId, frame->connectors[slot].pipe,
-		            frame->connectors[slot].pad, static_cast<uint32_t>(frame->connectors[slot].type), nIndex, nGmbus, nPipe);
-		frame->connectors[slot].index = nIndex;
-		frame->connectors[slot].busId = nGmbus;
-		frame->connectors[slot].pipe  = nPipe;
-		frame->connectors[slot].pad   = 0;
-		frame->connectors[slot].type  = ConnectorHDMI;        // 0x800: this is what isTarget() looks for
-		return true;
+		// 8 KB, not the kext size: on 11+ WhateverGreen is handed the __TEXT span only while this table sits in a data
+		// segment, so an image-bounded scan can end up walking nothing at all.
+		constexpr size_t scanBytes = 8 * 1024;
+		auto words = reinterpret_cast<uint32_t *>(base);
+		bool found = false;
+
+		// The configured platform id first: that is the entry the driver uses, and patching only it leaves the rest of
+		// the table alone.
+		for (size_t i = 0; platformId && platformId != 0xFFFFFFFF && i + 58 <= scanBytes / 4; i++) {
+			if (words[i] != platformId) continue;
+			found = true;
+			if (patchOneEntry(words + i, platformId)) return;
+			HLOG_ALWAYS("entry 0x%08X has no DisplayPort connector on GMBUS pin 10", platformId);
+			break;
+		}
+
+		// Otherwise the id is not in this build's table and the driver works from an entry of its own, so every entry
+		// that has the port gets the connector: only one of them is ever in use and the rest are inert.
+		if (found)
+			HLOG_ALWAYS("entry 0x%08X is unusable: patching every entry instead", platformId);
+		else
+			HLOG_ALWAYS("platform id 0x%08X is not in the first %u bytes (first id 0x%08X): patching every entry",
+			            platformId, (unsigned)scanBytes, words[0]);
+
+		int patched = 0;
+		for (size_t i = 0; i + 58 <= scanBytes / 4; i++)
+			if (patchOneEntry(words + i, platformId)) patched++;
+		HLOG_ALWAYS("%d connector(s) patched in the table", patched);
 	}
 
 	// ---------------------------------------------------------------------------------------------------------------------
@@ -864,7 +854,7 @@ namespace HDMIB {
 	}
 
 	static inline void install(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size,
-	                           uint32_t platformId, bool framebufferPatched) {
+	                           uint32_t platformId) {
 		// Baked build: no boot argument is needed, the module is part of the driver. igfxhdmib-off=1 is the escape hatch
 		// (one kext for machines where it misbehaves); the old -igfxhdmib is accepted and ignored.
 		if (!enabled()) return;
@@ -904,11 +894,9 @@ namespace HDMIB {
 
 		// The connector entry has to be in the table before the driver builds its ports from it. Do it here, at kext
 		// load, which is earlier than WhateverGreen's own applyFramebufferPatches (it runs from getOSInformation at
-		// start), so a user framebuffer patch cannot be disturbed by it either.
-		if (framebufferPatched)
-			HLOG_ALWAYS("a framebuffer patch is configured: leaving the connector table to WhateverGreen");
-		else
-			patchConnectorEntry(platformId, patcher, index, address, size);
+		// start). Run it unconditionally: a leftover framebuffer-patch* cannot reach an entry beyond WhateverGreen's
+		// one-page scan (exactly why 0x8A5C0002 fails), so it must not suppress this patch.
+		patchConnectorEntry(platformId, patcher, index, address, size);
 
 		auto solve = [&](const char *sym) { return patcher.solveSymbol(index, sym, address, size); };
 		auto gp = solve("__ZN14AppleIntelPort12getPortByDDIEj");

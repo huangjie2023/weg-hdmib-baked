@@ -52,7 +52,7 @@ jobs:
           lipo -info WhateverGreen.kext/Contents/MacOS/WhateverGreen
           /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' WhateverGreen.kext/Contents/Info.plist
           strings WhateverGreen.kext/Contents/MacOS/WhateverGreen | grep -c 'HDMIB' || true
-          strings WhateverGreen.kext/Contents/MacOS/WhateverGreen | grep -c '1.0-hj39-baked' || true
+          strings WhateverGreen.kext/Contents/MacOS/WhateverGreen | grep -c '1.0-hj40-baked' || true
           codesign -v WhateverGreen.kext && echo "signature ok"
 
       - uses: actions/upload-artifact@v4
